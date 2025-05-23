@@ -15,7 +15,7 @@ class YOLOApp:
     def __init__(self, root):
         self.root = root
         self.root.title("YOLO Object Detector")
-        self.root.geometry("1000x750") # Aumenté un poco la altura para el nuevo botón
+        self.root.geometry("1000x800") # Aumenté un poco más la altura para los controles
 
         # --- Variables ---
         self.model = None
@@ -30,7 +30,11 @@ class YOLOApp:
         self.original_video_fps = 30 # FPS por defecto, se intentará obtener del video
 
         self.is_replaying = False # Flag para controlar la reproducción del video procesado
+        self.is_paused = False # Flag para pausar la reproducción
         self.replay_cap = None # VideoCapture para la reproducción
+        self.total_frames = 0 # Total de frames del video
+        self.current_frame_pos = 0 # Posición actual del frame
+        self.timeline_updating = False # Flag para evitar bucles al actualizar timeline
 
         # --- Estilo ---
         style = ttk.Style()
@@ -77,6 +81,40 @@ class YOLOApp:
         self.lbl_image_display = ttk.Label(display_panel, text="El contenido procesado se mostrará aquí.", anchor="center")
         self.lbl_image_display.pack(fill=tk.BOTH, expand=True)
         self.lbl_image_display.configure(background='lightgrey')
+
+        # --- Controles de Video ---
+        self.video_controls_frame = ttk.Frame(display_panel)
+        self.video_controls_frame.pack(fill=tk.X, pady=10)
+        self.video_controls_frame.pack_forget() # Ocultar inicialmente
+
+        # Botones de control
+        controls_buttons_frame = ttk.Frame(self.video_controls_frame)
+        controls_buttons_frame.pack(fill=tk.X, pady=5)
+
+        self.btn_play_pause = ttk.Button(controls_buttons_frame, text="▶️", command=self.toggle_play_pause, width=3)
+        self.btn_play_pause.pack(side=tk.LEFT, padx=5)
+
+        self.btn_stop = ttk.Button(controls_buttons_frame, text="⏹️", command=self.stop_replay, width=3)
+        self.btn_stop.pack(side=tk.LEFT, padx=5)
+
+        # Timeline (barra de progreso)
+        timeline_frame = ttk.Frame(self.video_controls_frame)
+        timeline_frame.pack(fill=tk.X, pady=5)
+
+        self.timeline_var = tk.DoubleVar()
+        self.timeline_scale = ttk.Scale(timeline_frame, from_=0, to=100, orient=tk.HORIZONTAL, 
+                                       variable=self.timeline_var, command=self.on_timeline_change)
+        self.timeline_scale.pack(fill=tk.X, padx=5)
+
+        # Etiquetas de tiempo
+        time_frame = ttk.Frame(self.video_controls_frame)
+        time_frame.pack(fill=tk.X, pady=2)
+
+        self.lbl_current_time = ttk.Label(time_frame, text="00:00", font=('Helvetica', 9))
+        self.lbl_current_time.pack(side=tk.LEFT)
+
+        self.lbl_total_time = ttk.Label(time_frame, text="00:00", font=('Helvetica', 9))
+        self.lbl_total_time.pack(side=tk.RIGHT)
 
         # --- Cargar modelo YOLO ---
         self.load_yolo_model()
@@ -327,9 +365,8 @@ class YOLOApp:
         if self.video_processing_active:
             messagebox.showwarning("Procesando", "No se puede reproducir mientras se procesa otro video.")
             return
-        if self.is_replaying: # Si ya está reproduciendo, podría ser un botón de "Pausar/Reanudar" o "Detener"
+        if self.is_replaying: # Si ya está reproduciendo, detener
             self.stop_replay()
-            # self.btn_play_processed.config(text="Reproducir Video Procesado") # Opcional: cambiar texto del botón
             return
 
         try:
@@ -339,46 +376,140 @@ class YOLOApp:
                 self.replay_cap = None
                 return
 
-            # Obtener FPS del video guardado (o usar el original si se guardó)
+            # Obtener propiedades del video
             replay_fps = self.replay_cap.get(cv2.CAP_PROP_FPS)
-            if replay_fps <= 0 : replay_fps = self.original_video_fps # Fallback al FPS original
-            if replay_fps <= 0 : replay_fps = 30 # Fallback general
+            if replay_fps <= 0 : replay_fps = self.original_video_fps
+            if replay_fps <= 0 : replay_fps = 30
 
+            self.total_frames = int(self.replay_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            self.current_frame_pos = 0
             self.frame_delay_ms = int(1000 / replay_fps)
+            
+            # Configurar timeline
+            self.timeline_var.set(0)
+            self.timeline_scale.config(to=self.total_frames - 1)
+            
+            # Configurar etiquetas de tiempo
+            total_seconds = self.total_frames / replay_fps if replay_fps > 0 else 0
+            self.lbl_total_time.config(text=self.format_time(total_seconds))
+            self.lbl_current_time.config(text="00:00")
+            
             self.is_replaying = True
+            self.is_paused = False
             self.btn_load.config(state=tk.DISABLED)
             self.btn_process.config(state=tk.DISABLED)
-            # self.btn_play_processed.config(text="Detener Reproducción") # Opcional
+            self.btn_play_processed.config(text="Detener Video")
+            self.btn_play_pause.config(text="⏸️")
             self.lbl_status.config(text="Estado: Reproduciendo video...")
+            
+            # Mostrar controles de video
+            self.video_controls_frame.pack(fill=tk.X, pady=10)
+            
             self.replay_frame()
 
         except Exception as e:
             messagebox.showerror("Error de Reproducción", f"No se pudo iniciar la reproducción: {e}")
             self.stop_replay()
 
-
     def replay_frame(self):
         if not self.is_replaying or not self.replay_cap or not self.replay_cap.isOpened():
             self.stop_replay()
             return
 
-        ret, frame = self.replay_cap.read()
-        if ret:
-            self.display_image_preview(frame, is_processed_frame=True)
-            self.root.after(self.frame_delay_ms, self.replay_frame)
-        else: # Fin del video o error
-            self.stop_replay()
-            self.lbl_status.config(text="Estado: Reproducción finalizada.")
+        if not self.is_paused:
+            ret, frame = self.replay_cap.read()
+            if ret:
+                self.current_frame_pos = int(self.replay_cap.get(cv2.CAP_PROP_POS_FRAMES))
+                self.display_image_preview(frame, is_processed_frame=True)
+                self.update_timeline()
+                self.root.after(self.frame_delay_ms, self.replay_frame)
+            else: # Fin del video
+                self.stop_replay()
+                self.lbl_status.config(text="Estado: Reproducción finalizada.")
+        else:
+            # Si está pausado, seguir verificando pero no avanzar frames
+            self.root.after(100, self.replay_frame)
+
+    def toggle_play_pause(self):
+        if not self.is_replaying:
+            return
+            
+        self.is_paused = not self.is_paused
+        if self.is_paused:
+            self.btn_play_pause.config(text="▶️")
+            self.lbl_status.config(text="Estado: Video pausado.")
+        else:
+            self.btn_play_pause.config(text="⏸️")
+            self.lbl_status.config(text="Estado: Reproduciendo video...")
+
+    def on_timeline_change(self, value):
+        if not self.is_replaying or not self.replay_cap or self.timeline_updating:
+            return
+            
+        try:
+            frame_pos = int(float(value))
+            self.replay_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_pos)
+            self.current_frame_pos = frame_pos
+            
+            # Leer y mostrar el frame en la nueva posición
+            ret, frame = self.replay_cap.read()
+            if ret:
+                self.display_image_preview(frame, is_processed_frame=True)
+                # Retroceder un frame para que la reproducción continúe desde la posición correcta
+                self.replay_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_pos)
+            
+            self.update_time_display()
+            
+        except Exception as e:
+            print(f"Error al cambiar posición del timeline: {e}")
+
+    def update_timeline(self):
+        if not self.is_replaying or self.timeline_updating:
+            return
+            
+        self.timeline_updating = True
+        try:
+            self.timeline_var.set(self.current_frame_pos)
+            self.update_time_display()
+        finally:
+            self.timeline_updating = False
+
+    def update_time_display(self):
+        if not self.is_replaying or not self.replay_cap:
+            return
+            
+        try:
+            fps = self.replay_cap.get(cv2.CAP_PROP_FPS)
+            if fps <= 0:
+                fps = self.original_video_fps if self.original_video_fps > 0 else 30
+                
+            current_seconds = self.current_frame_pos / fps
+            self.lbl_current_time.config(text=self.format_time(current_seconds))
+        except Exception as e:
+            print(f"Error al actualizar tiempo: {e}")
+
+    def format_time(self, seconds):
+        """Convierte segundos a formato MM:SS"""
+        minutes = int(seconds // 60)
+        seconds = int(seconds % 60)
+        return f"{minutes:02d}:{seconds:02d}"
 
     def stop_replay(self):
         self.is_replaying = False
+        self.is_paused = False
         if self.replay_cap:
             self.replay_cap.release()
             self.replay_cap = None
+        
         self.btn_load.config(state=tk.NORMAL)
         self.btn_process.config(state=tk.NORMAL if self.filepath else tk.DISABLED)
-        # self.btn_play_processed.config(text="Reproducir Video Procesado") # Opcional
-        if not self.video_processing_active: # Solo cambiar si no hay otro proceso activo
+        self.btn_play_processed.config(text="Reproducir Video Procesado")
+        self.btn_play_pause.config(text="▶️")
+        
+        # Ocultar controles de video
+        self.video_controls_frame.pack_forget()
+        
+        if not self.video_processing_active:
              self.lbl_status.config(text="Estado: Listo" if not self.filepath else "Estado: Archivo cargado")
 
 
